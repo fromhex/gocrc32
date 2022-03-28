@@ -1,10 +1,12 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"fmt"
 	"log"
 	"os"
+	"regexp"
 	"strconv"
 
 	"github.com/urfave/cli/v2"
@@ -96,34 +98,59 @@ func findReverse(wantCrc uint32, oldCrc uint32) (patchBytes []byte) {
 	return
 }
 
-func getReverse(wantCrc uint32, oldCrc uint32) {
-	initTables(polyReverse, true)
-	patchBytes := findReverse(wantCrc, oldCrc)
-	// log.Printf("patchBytes: %#v\n", patchBytes)
-	checksum := calc(patchBytes, oldCrc)
-	if checksum == wantCrc {
-		log.Printf("验证checksum: 0x%08x OK\n", checksum)
-		log.Printf("4 Bytes: %#v\n", string(patchBytes))
+func addData(wantCrc uint32, oldCrc uint32, data []byte) {
+	patches := findReverse(wantCrc, calc(data, oldCrc))
+	// 四字节
+	if len(data) == 0 {
+		checksum := calc(patches, oldCrc)
+		if checksum == wantCrc {
+			log.Printf("验证checksum: 0x%08x OK\n", checksum)
+			log.Printf("4 Bytes: %#v\n", string(patches))
+		}
+		return
 	}
+	// 是否为常见字符
+	for _, v := range patches {
+		if bytes.IndexByte(allowChar, v) < 0 {
+			return
+		}
+	}
+	res := append(data, patches...)
+	log.Printf("%d Bytes: %#v\n", len(res), string(res))
+}
 
-	addData := func(data []byte) {
-		patches := findReverse(wantCrc, calc(data, oldCrc))
-		for _, v := range patches {
-			if bytes.IndexByte(allowChar, v) < 0 {
-				return
+func getReverse(wantCrc uint32, oldCrc uint32, size int) {
+	initTables(polyReverse, true)
+
+	// for i := 0; i < size-4; i++ {
+	// 	addData(wantCrc, oldCrc)
+	// }
+
+	switch size {
+	case 4:
+		addData(wantCrc, oldCrc, []byte{})
+	case 5:
+		for _, u := range allowChar {
+			addData(wantCrc, oldCrc, []byte{u})
+		}
+	case 6:
+		for _, u := range allowChar {
+			for _, v := range allowChar {
+				addData(wantCrc, oldCrc, []byte{u, v})
 			}
 		}
-		res := append(data, patches...)
-		log.Printf("%d Bytes: %#v\n", len(res), string(res))
-	}
-	for _, v := range allowChar {
-		addData([]byte{v})
-	}
-	for _, u := range allowChar {
-		for _, v := range allowChar {
-			addData([]byte{u, v})
+	default:
+		addData(wantCrc, oldCrc, []byte{})
+		for _, u := range allowChar {
+			addData(wantCrc, oldCrc, []byte{u})
+		}
+		for _, u := range allowChar {
+			for _, v := range allowChar {
+				addData(wantCrc, oldCrc, []byte{u, v})
+			}
 		}
 	}
+
 }
 func crc32(str string, oldCrc uint32) (crc32 uint32) {
 	initTables(polyReverse, true)
@@ -143,7 +170,7 @@ func main() {
 	app := &cli.App{
 		Name:    "gocrc32",
 		Usage:   "A cmd tool by golang of crc32 calc or crash",
-		Version: "v0.0.1",
+		Version: "v0.0.2",
 		Authors: []*cli.Author{&author},
 		Before: func(ctx *cli.Context) error {
 			fmt.Print(Banner)
@@ -166,15 +193,22 @@ func checkErr(err error) {
 
 var Calc = &cli.Command{
 	Name:        "calc",
-	Usage:       "calc 1234",
+	Usage:       "calc a string's CRC32",
 	Description: "计算字符的CRC32值",
 	Action:      doCalc,
 }
 var Reverse = &cli.Command{
 	Name:        "reverse",
-	Usage:       "reverse 0x11223344",
-	Description: "计算CRC32对应的4,5,6个字符",
+	Usage:       "reverse CRC32 or reverse -f zipfile",
+	Description: "计算CRC32对应的4,5,6个字符或者计算zip文件对应的CRC32",
 	Action:      doReverse,
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:    "file",
+			Aliases: []string{"f"},
+			Usage:   "Load CRC32 from zip file",
+		},
+	},
 }
 
 func doCalc(c *cli.Context) error {
@@ -183,8 +217,34 @@ func doCalc(c *cli.Context) error {
 	return nil
 }
 func doReverse(c *cli.Context) error {
+	// zip文件
+	if c.NumFlags() > 0 {
+		tmp := c.String("file")
+		getZipReverse(tmp)
+		return nil
+	}
+	// CRC值
 	tmp := c.Args().First()
+	pattern := `0x[0-9a-fA-F]{8}`
+	m, _ := regexp.MatchString(pattern, tmp)
+	if !m {
+		log.Println("请输入合法CRC32, 例如: 0x11223344")
+		return nil
+	}
 	crc, _ := strconv.ParseUint(tmp, 0, 32)
-	getReverse(uint32(crc), 0)
+	getReverse(uint32(crc), 0, 0)
 	return nil
+}
+
+func getZipReverse(zipFile string) {
+	zr, err := zip.OpenReader(zipFile)
+	checkErr(err)
+
+	for _, file := range zr.File {
+		if file.FileInfo().IsDir() {
+			continue
+		}
+		log.Printf("found file %v,crc32 0x%08x,file size %v\n", file.Name, file.CRC32, file.FileInfo().Size())
+		getReverse(file.CRC32, 0, int(file.FileInfo().Size()))
+	}
 }
